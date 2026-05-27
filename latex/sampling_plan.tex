@@ -1,0 +1,406 @@
+\documentclass[10pt]{article}
+
+\usepackage[a4paper,margin=1.65cm]{geometry}
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{array}
+
+\definecolor{accent}{HTML}{1F4E79}
+\definecolor{textgray}{HTML}{333333}
+\definecolor{muted}{HTML}{666666}
+\definecolor{linegray}{HTML}{D7DEE8}
+
+\pagestyle{empty}
+\hypersetup{colorlinks=true,linkcolor=accent,urlcolor=accent}
+\color{textgray}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.36em}
+\setlist[itemize]{leftmargin=1.35em,itemsep=0.08em,topsep=0.12em}
+\titleformat{\section}{\large\bfseries\color{accent}}{}{0pt}{}[\vspace{-0.25em}{\color{linegray}\titlerule}]
+\titlespacing*{\section}{0pt}{0.85em}{0.28em}
+\titleformat{\subsection}{\normalsize\bfseries\color{accent}}{}{0pt}{}
+\titlespacing*{\subsection}{0pt}{0.55em}{0.12em}
+
+\newcommand{\norm}[1]{\lVert#1\rVert}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\begin{document}
+
+{\color{accent}\Large\bfseries Sampling plan for Kolmogorov inverse problems}\\
+{\color{muted}\small Что уже реализовано, как этим пользоваться, что добавить для conditional sampling}
+
+\section{Что уже сделано}
+
+\subsection{Датасет}
+
+Основной датасет для дальнейших inverse experiments --- velocity snapshots Kolmogorov flow:
+\[
+    u = (u_x,u_y), \qquad [N,2,64,64].
+\]
+
+Данные генерируются в \code{kolmogorov_dataset/}. Симуляция идет в vorticity form на
+periodic grid. В текущем варианте поле считается на \(256{\times}256\), затем velocity
+усредняется до \(64{\times}64\). В \code{.npz} сохраняются raw values, без нормализации.
+
+Что лежит в одном chunk:
+\begin{itemize}
+  \item \code{images}: velocity fields \([N,2,H,W]\);
+  \item \code{trajectory_id}, \code{snapshot_index}, \code{step}: откуда взят snapshot;
+  \item \code{viscosity}, \code{drag}, \code{forcing_amp}: параметры симуляции;
+  \item \code{split}: train / val / test.
+\end{itemize}
+
+\subsection{Обучение prior}
+
+Основной prior --- VP-SDE score model из \code{score_training/}. Модель предсказывает
+noise \(\varepsilon\) из зашумленного поля:
+\[
+    x_t = \mu_t x_0 + \sigma_t \varepsilon,
+    \qquad
+    \mu_t=\cos(\omega t),
+    \qquad
+    \sigma_t=\sqrt{1-\mu_t^2}.
+\]
+
+Вход модели:
+\[
+    [x_t,\sin x,\cos x,\sin y,\cos y].
+\]
+Координатные Fourier channels добавляются как clean conditioning channels: они не шумятся
+и не участвуют в loss. UNet --- \code{diffusers.UNet2DModel} с circular padding.
+
+Нормализация считается только по train split:
+\[
+    x_{\mathrm{norm}} = \frac{x_{\mathrm{raw}}-\mathrm{mean}}{\mathrm{std}}.
+\]
+\code{mean} и \code{std} сохраняются в checkpoint. Все samplers должны работать в
+normalized space. Метрики и картинки нужно считать в raw space.
+
+\subsection{Unconditional sampling}
+
+В \code{score_training/sde.py} уже есть deterministic VP sampler. На каждом шаге:
+\[
+    \hat x_0 =
+    \frac{x_t-\sigma_t\varepsilon_\theta(x_t,t)}{\mu_t},
+    \qquad
+    x_{t_{\mathrm{next}}} =
+    \mu_{t_{\mathrm{next}}}\hat x_0
+    + \sigma_{t_{\mathrm{next}}}\varepsilon_\theta(x_t,t).
+\]
+
+Conditional samplers используют тот же reverse process. Сначала модель предсказывает
+\(\varepsilon_\theta(x_t,t)\), затем из него считается \(\hat x_0\). После этого sampler
+добавляет информацию из observation \(y\): либо меняет \(\hat x_0\), либо делает correction
+для \(x_t\), либо склеивает known/unknown regions.
+
+\section{Observation operators}
+
+Для сравнения методов будут использоваться четыре фиксированных оператора наблюдения.
+Все они применяются к двум velocity channels одинаково.
+
+\begin{itemize}
+  \item \textbf{Regular sparse grid.} Известны значения \(u_x,u_y\) в узлах регулярной
+        сетки с шагом 4 по обеим координатам:
+        \(M_{ij}=1\) для \(i\bmod 4=0,\; j\bmod 4=0\).
+        Observation имеет тот же spatial size \(64{\times}64\), но значения вне mask
+        не используются.
+  \item \textbf{Central box mask.} Известно полное velocity field внутри центрального окна
+        \(32{\times}32\):
+        \[
+            i,j \in \{16,\ldots,47\}.
+        \]
+        Вне окна поле неизвестно.
+  \item \textbf{Average downsample.} Observation получается average pooling:
+        \[
+            A: [2,64,64]\rightarrow [2,16,16],
+        \]
+        kernel \(4{\times}4\), stride 4.
+  \item \textbf{Periodic Gaussian blur.} Observation получается circular convolution
+        с Gaussian kernel, \(\sigma=2\) grid cells. После blur добавляется Gaussian noise
+        с фиксированным \(\sigma_y\).
+\end{itemize}
+
+\section{Sampling methods}
+
+\subsection{DDNM}
+
+Используется для линейных операторов, где есть \(A^\dagger\). Самый простой первый
+case --- mask/inpainting.
+
+На каждом reverse step:
+\[
+    \hat x_0 =
+    \frac{x_t-\sigma_t\varepsilon_\theta(x_t,t)}{\mu_t}.
+\]
+Затем заменить observed part:
+\[
+    \hat x_0^{\mathrm{corr}}
+    =
+    A^\dagger y + (I-A^\dagger A)\hat x_0.
+\]
+После этого сделать обычный VP reverse step, но уже из \(\hat x_0^{\mathrm{corr}}\).
+
+Для mask оператор \(A(x)=M\odot x\), а \(A^\dagger(y)=M\odot y\). Поэтому correction
+упрощается до замены known pixels:
+\[
+    \hat x_0^{\mathrm{corr}} = y_{\mathrm{known}} + (1-M)\odot \hat x_0.
+\]
+Для noisy observations вместо жесткой замены лучше использовать soft update:
+\[
+    \hat x_0^{\mathrm{corr}}
+    =
+    \hat x_0 + \lambda_t A^\dagger(y-A\hat x_0).
+\]
+
+\subsection{DPS}
+
+DPS работает для любого differentiable \(A\). Он не требует \(A^\dagger\), но требует
+gradient через модель.
+
+На каждом шаге \(x_t\) должен быть differentiable. Модель дает \(\hat x_0(x_t,t)\),
+после чего считается measurement loss:
+\[
+    L_y=\norm{A(\hat x_0)-y}_2^2.
+\]
+Gradient по текущему noisy state:
+\[
+    g=\nabla_{x_t}L_y
+\]
+используется как correction:
+\[
+    x_t^{\mathrm{corr}} = x_t - s_t g.
+\]
+Дальше reverse step идет из corrected state.
+
+Веса модели не обновляются. Optimizer не нужен. Нужно только autograd по \(x_t\).
+
+Параметры:
+\begin{itemize}
+  \item \code{guidance_scale}: общий масштаб gradient step;
+  \item \code{measurement_sigma}: шум observation;
+  \item \code{guidance_start}, \code{guidance_end}: диапазон \(t\), где включается guidance;
+  \item gradient clipping или normalization для устойчивости.
+\end{itemize}
+
+\subsection{RePaint}
+
+RePaint использовать только для mask. Для blur/downsample он не подходит.
+
+Идея: known region каждый раз заменяется observation, зашумленным до текущего уровня \(t\).
+Unknown region генерируется моделью.
+
+Known part строится через forward noising observation:
+\[
+    x_t^{\mathrm{known}} = \mu_t y + \sigma_t \varepsilon.
+\]
+Unknown part берется из prior step модели. Затем они склеиваются по mask:
+\[
+    x_t = M\odot x_t^{\mathrm{known}} + (1-M)\odot x_t^{\mathrm{generated}}.
+\]
+Jumps добавляются поверх этого процесса: sampler иногда переходит назад к более шумному
+состоянию и повторяет несколько reverse steps, чтобы согласовать границу между observed
+и generated regions.
+
+\subsection{DDRM}
+
+DDRM нужен для линейных операторов, которые удобно диагонализовать. Для нас это blur и
+часть downsample/super-resolution experiments. Делать его после DDNM и DPS.
+
+Идея: работать в basis, где \(A\) раскладывается по singular values:
+\[
+    A = U\Sigma V^\top.
+\]
+Для каждого spectral component отдельно смешивается prior prediction и measurement.
+
+Для periodic blur удобно использовать Fourier basis. Blur тогда становится умножением
+на transfer function \(H(k)\). Correction считается по каждому \(k\) отдельно, с учетом
+\(H(k)\), текущего diffusion noise и measurement noise \(\sigma_y\).
+
+\section{Methods vs observations}
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.17\linewidth}p{0.16\linewidth}p{0.17\linewidth}p{0.16\linewidth}}
+\toprule
+\textbf{Method} & \textbf{Sparse grid} & \textbf{Box mask} &
+\textbf{Downsample} & \textbf{Blur} \\
+\midrule
+DDNM &
+yes &
+yes &
+yes &
+yes \\
+DPS &
+yes &
+yes &
+yes &
+yes \\
+RePaint &
+yes &
+yes &
+no &
+no \\
+DDRM &
+not primary &
+not primary &
+yes &
+yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+DDNM and RePaint are most natural for masks. DPS is the general differentiable
+baseline and can be run for all four operators. DDRM is reserved for operators with
+a convenient spectral representation: downsample and blur.
+
+\section{Physics-informed sampling}
+
+Для Kolmogorov velocity fields основное физическое ограничение:
+\[
+    \nabla\cdot u = 0.
+\]
+Его можно добавлять к sampling без переобучения модели. Базовый вариант --- Helmholtz
+projection в Fourier space:
+\[
+    \hat u_{\mathrm{proj}}(k)
+    =
+    \hat u(k)
+    -
+    k\,\frac{k\cdot \hat u(k)}{\norm{k}^2},
+    \qquad k\ne0.
+\]
+Она удаляет compressible component и оставляет divergence-free part поля. Projection
+нужно применять в normalized model space или в raw space согласованно с тем, где делается
+correction. Для финальных метрик поле все равно переводится в raw space.
+
+\subsection{DDNM + physics}
+
+В DDNM physics удобно применять к \(\hat x_0^{\mathrm{corr}}\). Сначала делается
+data-consistency correction:
+\[
+    \hat x_0^{\mathrm{corr}}
+    =
+    A^\dagger y + (I-A^\dagger A)\hat x_0,
+\]
+после этого к corrected estimate применяется Helmholtz projection:
+\[
+    \hat x_0^{\mathrm{phys}} = P_{\mathrm{divfree}}(\hat x_0^{\mathrm{corr}}).
+\]
+Дальше VP reverse step использует \(\hat x_0^{\mathrm{phys}}\).
+
+Для mask observations есть важный trade-off: hard projection может немного изменить known
+pixels. Если нужно строго сохранить observation, можно делать projection только на unknown
+part или после projection повторно вставлять known pixels.
+
+\subsection{DPS + physics}
+
+В DPS physics можно добавить как дополнительный guidance term:
+\[
+    L = L_y + \lambda_{\mathrm{div}} L_{\mathrm{div}},
+    \qquad
+    L_{\mathrm{div}} = \norm{\nabla\cdot \hat x_0}_2^2.
+\]
+Тогда gradient correction считается по общей функции \(L\):
+\[
+    x_t^{\mathrm{corr}}
+    =
+    x_t - s_t \nabla_{x_t}L.
+\]
+Это soft physics guidance. Его удобно использовать вместе с differentiable operators,
+потому что DPS уже требует autograd по \(x_t\).
+
+Альтернативный вариант --- не добавлять \(L_{\mathrm{div}}\), а после DPS correction
+проецировать \(\hat x_0\) через Helmholtz projection. Это проще и стабильнее, но может
+конфликтовать с observation consistency для mask.
+
+\subsection{RePaint + physics}
+
+В RePaint known region задается observation, unknown region генерируется prior-ом. Поэтому
+physics projection лучше применять к generated/unknown part, а known part затем снова
+вставлять по mask:
+\[
+    x = M\odot x_{\mathrm{known}} + (1-M)\odot P_{\mathrm{divfree}}(x_{\mathrm{generated}}).
+\]
+Если применить projection ко всему полю сразу, known pixels могут измениться. Это плохо для
+inpainting setting, где observed region должен оставаться фиксированным.
+
+\subsection{DDRM + physics}
+
+В DDRM data update происходит в spectral/SVD basis. Physics projection тоже удобно делать
+в Fourier space, поэтому для blur этот вариант естественный: после spectral DDRM update
+можно применить Helmholtz projection к velocity field.
+
+Для downsample projection тоже возможна, но порядок важен. Практичный вариант:
+сначала выполнить DDRM measurement update, затем Helmholtz projection, затем следующий
+reverse step. Если projection заметно ухудшает consistency с low-resolution observation,
+можно добавить повторную мягкую correction по \(A(\hat x_0)-y\).
+
+\section{Evaluation pipeline}
+
+Evaluation должен быть одинаковым для всех методов. Для held-out field
+\(u_{\mathrm{true}}\) строится observation
+\[
+    y = A(u_{\mathrm{true}}) + \eta.
+\]
+Sampler получает один и тот же checkpoint, один и тот же operator \(A\), один и тот же
+noise level и фиксированный seed. Внутри sampler все вычисления идут в normalized space.
+После sampling reconstruction переводится обратно в raw velocity space, и уже там
+считаются метрики и строятся plots.
+
+Для каждого запуска сохраняется одна строка в CSV. Для небольшой подвыборки сохраняются
+PNG visualizations: ground truth, observation, reconstruction, error map и vorticity.
+
+Минимальный набор experiments:
+\begin{itemize}
+  \item regular sparse grid, stride 4;
+  \item central box mask, \(32{\times}32\);
+  \item downsample: \(64{\times}64 \rightarrow 16{\times}16\);
+  \item Gaussian blur, \(\sigma=2\), with Gaussian observation noise.
+\end{itemize}
+
+Для debug run достаточно \(N=16\), one seed. Для финальной таблицы: \(N=256\), seeds
+\(\{0,1,2\}\).
+
+\section{Metrics}
+
+Все метрики считаются в raw velocity space.
+
+\begin{itemize}
+  \item Relative L2:
+        \[
+            \frac{\norm{\hat u-u_{\mathrm{true}}}_2}
+                 {\norm{u_{\mathrm{true}}}_2}.
+        \]
+  \item RMSE:
+        \[
+            \sqrt{\frac{1}{2HW}\norm{\hat u-u_{\mathrm{true}}}_2^2}.
+        \]
+  \item Measurement consistency:
+        \[
+            \frac{\norm{A(\hat u)-y}_2}{\norm{y}_2}.
+        \]
+  \item Divergence:
+        \[
+            \frac{\norm{\nabla\cdot \hat u}_2}{\norm{\hat u}_2}.
+        \]
+  \item Vorticity RMSE. Сначала считать
+        \[
+            \omega = \partial_x u_y - \partial_y u_x,
+        \]
+        затем RMSE между \(\omega(\hat u)\) и \(\omega(u_{\mathrm{true}})\).
+\end{itemize}
+
+CSV columns:
+\begin{verbatim}
+sample_id, seed, method, operator, noise_sigma,
+rel_l2, rmse, measurement_error, divergence, vorticity_rmse
+\end{verbatim}
+
+\end{document}

@@ -1,0 +1,25 @@
+{
+  "latex-workshop.latex.outDir": "%DIR%",
+  "latex-workshop.latex.recipes": [
+    {
+      "name": "latexmk (presentation)",
+      "tools": [
+        "latexmk-presentation"
+      ]
+    }
+  ],
+  "latex-workshop.latex.tools": [
+    {
+      "name": "latexmk-presentation",
+      "command": "latexmk",
+      "args": [
+        "-pdf",
+        "-silent",
+        "-interaction=batchmode",
+        "-halt-on-error",
+        "-cd",
+        "%DOC%"
+      ]
+    }
+  ]
+}

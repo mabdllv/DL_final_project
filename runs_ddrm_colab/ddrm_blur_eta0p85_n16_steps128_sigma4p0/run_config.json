@@ -1,0 +1,92 @@
+{
+  "experiment_config": {
+    "checkpoint_path": "checkpoints/wrapped_ema_checkpoint.pt",
+    "case_file": "inverse_cases/blur_blur4p0_val16_vis8_seed0.npz",
+    "output_dir": "runs_ddrm_colab/ddrm_blur_eta0p85_n16_steps128_sigma4p0",
+    "method": "ddrm",
+    "device": "auto",
+    "batch_size": 32,
+    "steps": 128,
+    "seed": 0,
+    "max_visualizations": 8,
+    "visualization_sample_count": 8,
+    "guidance_scale": 1.0,
+    "measurement_sigma": 0.05,
+    "guidance_start": 1.0,
+    "guidance_end": 0.0,
+    "gradient_clip": 0.0,
+    "div_weight": 0.0,
+    "eta": 0.85,
+    "physics_projection": false
+  },
+  "case_metadata": {
+    "case_config": {
+      "data_source": "data/one_val_cache",
+      "output_path": "inverse_cases/blur_blur4p0_val16_vis8_seed0.npz",
+      "operator": "blur",
+      "split": "val",
+      "image_key": "images",
+      "cache_dir": "data/download_cache",
+      "num_samples": 16,
+      "sample_seed": 0,
+      "visualization_count": 8,
+      "visualization_seed": 0,
+      "corruption_seed": 0,
+      "noise_sigma": 0.0,
+      "stride": 4,
+      "downsample_factor": 4,
+      "blur_sigma": 4.0,
+      "device": "cuda",
+      "case_batch_size": 256
+    },
+    "shape": [
+      16,
+      2,
+      64,
+      64
+    ],
+    "observation_shape": [
+      16,
+      2,
+      64,
+      64
+    ],
+    "sample_ids": [
+      "traj1659_snap47",
+      "traj1717_snap6",
+      "traj1691_snap5",
+      "traj1672_snap19",
+      "traj1672_snap22",
+      "traj1650_snap15",
+      "traj1713_snap12",
+      "traj1651_snap33",
+      "traj1627_snap36",
+      "traj1676_snap25",
+      "traj1655_snap39",
+      "traj1625_snap39",
+      "traj1613_snap25",
+      "traj1655_snap41",
+      "traj1673_snap4",
+      "traj1639_snap41"
+    ],
+    "operator_name": "periodic_gaussian_blur_sigma4"
+  },
+  "data_stats": {
+    "mean": [
+      1.7451092654274802e-12,
+      2.7684701319613536e-12
+    ],
+    "std": [
+      0.4383140802383423,
+      0.4253821074962616
+    ],
+    "channels": 2,
+    "height": 64,
+    "width": 64,
+    "train_count": 0,
+    "val_count": 5000,
+    "source": "data/one_val_cache/val_000.npz",
+    "stats_source": "checkpoints/best_score_vp_kolmogorov_velocity_256_to_64_coords_2ch_64x64_coords_bf16_20260517_221201_epoch_0014_val_0.028523.pt:data_stats"
+  },
+  "operator_name": "periodic_gaussian_blur_sigma4"
+}
